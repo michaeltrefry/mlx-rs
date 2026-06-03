@@ -78,21 +78,50 @@ fn prepare_mlx_c_source() -> PathBuf {
     }
     copy_dir_recursive(&src, &staged).expect("Failed to copy mlx-c to staging");
 
+    // sc-2781: patch the STAGED mlx-c fft bindings so mlx-c 0.6.0 compiles against MLX 0.31.2.
+    // 0.31.2 inserted an `FFTNorm norm = FFTNorm::Backward` parameter before `StreamOrDevice s`
+    // across the fftn/ifftn/fft/ifft/rfft/irfft family; mlx-c 0.6.0 calls `fft*(... stream)`, so
+    // `stream` mis-binds to `norm` and won't compile. The patch passes `FFTNorm::Backward`
+    // explicitly at the 12 norm call sites (the 2 shift fns are unchanged), keeping the C API
+    // identical → no Rust-binding cascade. The submodule stays pristine at Apple upstream v0.6.0.
+    // TEMPORARY: drop once Apple tags an mlx-c release that supports 0.31.2 (main already does).
+    // Unlike the MLX combined.patch (applied to the fetched MLX git checkout via CMake
+    // PATCH_COMMAND), this targets the copied mlx-c source tree, so we apply it here with `patch`.
+    let fft_patch =
+        std::fs::canonicalize("patches/mlx-c-fft-norm.patch").expect("find mlx-c-fft-norm.patch");
+    let status = Command::new("patch")
+        .arg("-p1")
+        .arg("-d")
+        .arg(&staged)
+        .arg("-i")
+        .arg(&fft_patch)
+        .status()
+        .expect("Failed to run `patch` for mlx-c-fft-norm.patch");
+    assert!(
+        status.success(),
+        "mlx-c-fft-norm.patch failed to apply to staged mlx-c (sc-2781)"
+    );
+    println!("cargo:rerun-if-changed=patches/mlx-c-fft-norm.patch");
+
     // Copy our patch files into the staged source and concatenate them into a
     // single multi-file patch. FetchContent allows only one PATCH_COMMAND, so we
     // apply all MLX source patches with one `git apply` — structurally identical
     // to the proven single-patch mechanism, and both apply atomically.
     //   - metallib-search-path.patch : pmetal metallib resolver (device.cpp)
-    //   - nax-16bit-dense-gate.patch : gate the broken NAX 16-bit dense GEMM to
-    //     f32/TF32 only so bf16/f16 fall through to the correct non-NAX kernel
-    //     (sc-2714; remove once upstream MLX fixes steel_gemm_fused_nax). The
-    //     mlx-gen tripwire `bf16_matmul_sweep.rs` verifies this actually applied.
+    //
+    // The sc-2714 (dense GEMM) and sc-2770 (fast SDPA) NAX-dispatch gate patches were
+    // REMOVED in sc-2772. Their root cause was never the dispatch or the MLX version: the
+    // NAX matrix-unit kernels (`mpp::tensor_ops::matmul2d`) are only valid for macOS >= 26.2
+    // (the `is_nax_available()` floor), but the metal kernels were being compiled with
+    // `-mmacosx-version-min=26.0` (the old MACOSX_DEPLOYMENT_TARGET), BELOW that floor, so
+    // metalfe miscompiled the tensor-op intrinsic to garbage for 16-bit. Compiling the
+    // kernels at >= 26.2 (mlx-gen's .cargo/config.toml now sets 26.2) makes the NAX 16-bit
+    // GEMM + SDPA correct, so the dispatch gates are unnecessary and 16-bit now uses the
+    // (correct, faster) NAX matrix unit. The `bf16_matmul_sweep` + `sdpa_nax_repro` tripwires
+    // still assert 16-bit correctness — now they guard the deployment-target fix.
     let patches_dir = staged.join("patches");
     std::fs::create_dir_all(&patches_dir).expect("Failed to create patches dir");
-    let patch_files = [
-        "patches/metallib-search-path.patch",
-        "patches/nax-16bit-dense-gate.patch",
-    ];
+    let patch_files = ["patches/metallib-search-path.patch"];
     let mut combined = String::new();
     for pf in patch_files {
         let name = std::path::Path::new(pf).file_name().unwrap();
@@ -108,13 +137,15 @@ fn prepare_mlx_c_source() -> PathBuf {
     std::fs::write(patches_dir.join("combined.patch"), &combined)
         .expect("Failed to write combined patch");
 
-    // Inject PATCH_COMMAND into the FetchContent_Declare for MLX
+    // Inject PATCH_COMMAND into the FetchContent_Declare for MLX, and bump the fetched MLX tag
+    // v0.31.1 -> v0.31.2 (sc-2781: byte-parity with the 0.31.2 production/golden environments).
+    // The MLX combined.patch (metallib-search-path) still applies via the single CMake PATCH_COMMAND.
     let cmake_path = staged.join("CMakeLists.txt");
     let cmake_content =
         std::fs::read_to_string(&cmake_path).expect("Failed to read CMakeLists.txt");
     let patched = cmake_content.replace(
         "GIT_TAG v0.31.1)",
-        "GIT_TAG v0.31.1\n    PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/combined.patch || true)",
+        "GIT_TAG v0.31.2\n    PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/combined.patch || true)",
     );
     std::fs::write(&cmake_path, patched).expect("Failed to write patched CMakeLists.txt");
 
