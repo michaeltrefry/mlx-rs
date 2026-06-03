@@ -83,24 +83,20 @@ fn prepare_mlx_c_source() -> PathBuf {
     // apply all MLX source patches with one `git apply` — structurally identical
     // to the proven single-patch mechanism, and both apply atomically.
     //   - metallib-search-path.patch : pmetal metallib resolver (device.cpp)
-    //   - nax-16bit-dense-gate.patch : gate the broken NAX 16-bit dense GEMM to
-    //     f32/TF32 only so bf16/f16 fall through to the correct non-NAX kernel
-    //     (sc-2714; remove once upstream MLX fixes steel_gemm_fused_nax). The
-    //     mlx-gen tripwire `bf16_matmul_sweep.rs` verifies this actually applied.
-    //   - nax-16bit-sdpa-gate.patch : the SDPA twin of the dense-GEMM bug — the
-    //     NAX fused-attention kernel (sdpa_full_self_attention_nax) returns
-    //     garbage for 16-bit q/k/v, so gate it to f32/TF32 only; bf16/f16 fall
-    //     through to the correct non-NAX `sdpa_full` steel kernel (still fused +
-    //     memory-efficient, NOT the O(L²) fallback). Same dispatch condition as
-    //     the dense gate (sc-2770; remove once upstream MLX fixes it). The
-    //     mlx-gen tripwire `sdpa_nax_repro.rs` verifies this actually applied.
+    //
+    // The sc-2714 (dense GEMM) and sc-2770 (fast SDPA) NAX-dispatch gate patches were
+    // REMOVED in sc-2772. Their root cause was never the dispatch or the MLX version: the
+    // NAX matrix-unit kernels (`mpp::tensor_ops::matmul2d`) are only valid for macOS >= 26.2
+    // (the `is_nax_available()` floor), but the metal kernels were being compiled with
+    // `-mmacosx-version-min=26.0` (the old MACOSX_DEPLOYMENT_TARGET), BELOW that floor, so
+    // metalfe miscompiled the tensor-op intrinsic to garbage for 16-bit. Compiling the
+    // kernels at >= 26.2 (mlx-gen's .cargo/config.toml now sets 26.2) makes the NAX 16-bit
+    // GEMM + SDPA correct, so the dispatch gates are unnecessary and 16-bit now uses the
+    // (correct, faster) NAX matrix unit. The `bf16_matmul_sweep` + `sdpa_nax_repro` tripwires
+    // still assert 16-bit correctness — now they guard the deployment-target fix.
     let patches_dir = staged.join("patches");
     std::fs::create_dir_all(&patches_dir).expect("Failed to create patches dir");
-    let patch_files = [
-        "patches/metallib-search-path.patch",
-        "patches/nax-16bit-dense-gate.patch",
-        "patches/nax-16bit-sdpa-gate.patch",
-    ];
+    let patch_files = ["patches/metallib-search-path.patch"];
     let mut combined = String::new();
     for pf in patch_files {
         let name = std::path::Path::new(pf).file_name().unwrap();
