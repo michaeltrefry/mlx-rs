@@ -91,6 +91,41 @@ pub fn async_eval_params(params: ModuleParamRef<'_>) -> Result<()> {
     async_eval(params.flatten().values().copied())
 }
 
+/// Gradient (activation) checkpointing.
+///
+/// Returns a function equivalent to `f` in the forward pass, but whose **backward** pass recomputes
+/// `f` from its inputs instead of retaining `f`'s intermediate activations on the autograd tape.
+/// Apply it per-segment (e.g. once per transformer block) inside a function being differentiated by
+/// [`value_and_grad`]/[`keyed_value_and_grad`] to bound the reverse-mode working set to a single
+/// segment's activations, at the cost of one recomputation of `f` during the backward pass.
+///
+/// Gradients flow to the arrays passed as **inputs** to the returned function. Per the module-level
+/// note, pass every array you need a gradient for as an input; arrays merely *captured* by `f` are
+/// baked into its graph as constants and receive no gradient (which is exactly what you want for
+/// frozen base weights — pass only the trainable parameters + activations as inputs).
+///
+/// Wraps `mlx::core::checkpoint`.
+pub fn checkpoint<'a, F>(f: F) -> impl FnMut(&[Array]) -> Result<Vec<Array>> + 'a
+where
+    F: FnMut(&[Array]) -> Result<Vec<Array>> + 'a,
+{
+    let inner = Closure::new_fallible(f);
+    move |inputs: &[Array]| -> Result<Vec<Array>> {
+        // Wrap the inner closure as a checkpointed closure, then apply it to `inputs`. Building the
+        // wrapper per call is cheap (it only re-references `inner`, no compute) and keeps `inner`
+        // borrowed for the lifetime of the returned closure.
+        let ckpt =
+            Closure::try_from_op(|res| unsafe { mlx_sys::mlx_checkpoint(res, inner.as_ptr()) })?;
+        let c_inputs = VectorArray::try_from_iter(inputs.iter())?;
+        let outputs = VectorArray::try_from_op(|res| unsafe {
+            mlx_sys::mlx_closure_apply(res, ckpt.as_ptr(), c_inputs.as_ptr())
+        })
+        .map_err(|e| get_and_clear_closure_error().unwrap_or(e))?;
+        let values: Vec<Array> = outputs.try_into_values()?;
+        Ok(values)
+    }
+}
+
 #[inline]
 fn jvp_inner(
     closure: Closure<'_>,
@@ -265,6 +300,133 @@ mod tests {
     use super::*;
 
     // The unit tests below are adapted from the mlx c++ codebase
+
+    // sc-4874: gradient (activation) checkpointing — used to bound the reverse-mode working set in
+    // the mlx-gen LoRA trainers. The decisive property: gradients w.r.t. the *explicit inputs* of a
+    // checkpointed segment must match the non-checkpointed graph exactly (to fp tolerance), even
+    // when the segment also reads a *captured constant* (the frozen base weight) that gets no grad.
+    #[test]
+    fn test_checkpoint_grad_matches_non_checkpointed() {
+        use crate::ops::tanh;
+        use crate::random;
+
+        let key = random::key(0).unwrap();
+        let wc = random::normal::<f32>(&[8, 8], None, None, Some(&key)).unwrap(); // captured constant
+        let x = random::normal::<f32>(&[4, 8], None, None, Some(&key)).unwrap(); // captured constant
+
+        // layer(h, p) = tanh(h @ wc + p), with `wc` and `x` captured; `p` is the trainable input.
+        let plain = |args: &[Array]| -> Result<Vec<Array>> {
+            let mut h = x.clone();
+            for p in args {
+                h = tanh(&(h.matmul(&wc)?.add(p)?))?;
+            }
+            Ok(vec![h.sum(None)?])
+        };
+        let ckpt = |args: &[Array]| -> Result<Vec<Array>> {
+            let mut h = x.clone();
+            for p in args {
+                let mut seg = checkpoint(|inp: &[Array]| -> Result<Vec<Array>> {
+                    Ok(vec![tanh(&(inp[0].matmul(&wc)?.add(&inp[1])?))?])
+                });
+                h = seg(&[h.clone(), p.clone()])?.into_iter().next().unwrap();
+            }
+            Ok(vec![h.sum(None)?])
+        };
+
+        let p0 = random::normal::<f32>(&[8], None, None, Some(&key)).unwrap();
+        let p1 = random::normal::<f32>(&[8], None, None, Some(&key)).unwrap();
+        let args = &[p0, p1];
+        let argnums = &[0, 1];
+
+        let (v_plain, g_plain) = value_and_grad_with_argnums(plain, argnums)(args).unwrap();
+        let (v_ckpt, g_ckpt) = value_and_grad_with_argnums(ckpt, argnums)(args).unwrap();
+
+        // Forward value matches.
+        assert!(
+            (v_plain[0].item::<f32>() - v_ckpt[0].item::<f32>()).abs() < 1e-4,
+            "forward value differs: {} vs {}",
+            v_plain[0].item::<f32>(),
+            v_ckpt[0].item::<f32>()
+        );
+        // Gradients w.r.t. each trainable input match (the property the trainer relies on).
+        for (gp, gc) in g_plain.iter().zip(g_ckpt.iter()) {
+            let d = gp.subtract(gc).unwrap().abs().unwrap().max(None).unwrap();
+            assert!(
+                d.item::<f32>() < 1e-4,
+                "checkpoint grad diverged: max|Δ| = {}",
+                d.item::<f32>()
+            );
+        }
+    }
+
+    // Per-segment checkpointing must reduce the backward-pass peak memory on a deep chain (the whole
+    // point). Build a chain deep/wide enough that retained activations dominate, and compare peaks.
+    #[test]
+    fn test_checkpoint_reduces_peak_memory() {
+        use crate::memory::{clear_cache, get_peak_memory, reset_peak_memory};
+        use crate::ops::tanh;
+        use crate::random;
+        use crate::transforms::eval;
+
+        // Deep stack with large activations and small weights, so the RETAINED forward activations
+        // dominate the peak — the regime checkpointing targets (the z-image 1024 case: ~105 GB of
+        // activations). At shallow depth / small activations, weight-grad + matmul temporaries
+        // dominate instead and checkpoint's recompute overhead loses; that is expected and is why
+        // this test is sized so activations dominate.
+        let key = random::key(1).unwrap();
+        let (n, d, hidden) = (256i32, 1024i32, 4096i32); // wide FFN: the [n,hidden] intermediate dominates
+        let depth = 96usize;
+        // Captured frozen "base weights" — the up/down projections of each segment's FFN.
+        let w_up = random::normal::<f32>(&[d, hidden], None, None, Some(&key)).unwrap();
+        let w_down = random::normal::<f32>(&[hidden, d], None, None, Some(&key)).unwrap();
+        let x = random::normal::<f32>(&[n, d], None, None, Some(&key)).unwrap();
+        let p = random::normal::<f32>(&[d], None, None, Some(&key)).unwrap();
+
+        // A representative block: up-project to a wide hidden, gelu, down-project, residual + bias.
+        // The wide [n,hidden] activation is exactly the kind of intermediate a real DiT block retains
+        // for the backward — and what per-segment checkpointing recomputes instead of storing.
+        let run = |use_ckpt: bool| -> usize {
+            let f = |args: &[Array]| -> Result<Vec<Array>> {
+                let mut h = x.clone();
+                for _ in 0..depth {
+                    if use_ckpt {
+                        let mut seg = checkpoint(|inp: &[Array]| -> Result<Vec<Array>> {
+                            let up = tanh(&inp[0].matmul(&w_up)?)?;
+                            let down = up.matmul(&w_down)?;
+                            Ok(vec![tanh(&down.add(&inp[1])?)?])
+                        });
+                        h = seg(&[h.clone(), args[0].clone()])?
+                            .into_iter()
+                            .next()
+                            .unwrap();
+                    } else {
+                        let up = tanh(&h.matmul(&w_up)?)?;
+                        let down = up.matmul(&w_down)?;
+                        h = tanh(&down.add(&args[0])?)?;
+                    }
+                }
+                Ok(vec![h.sum(None)?])
+            };
+            clear_cache();
+            reset_peak_memory();
+            let (_v, g) = value_and_grad_with_argnums(f, &[0])(&[p.clone()]).unwrap();
+            eval(g.iter()).unwrap();
+            get_peak_memory()
+        };
+
+        let peak_plain = run(false);
+        let peak_ckpt = run(true);
+        eprintln!(
+            "[checkpoint] peak plain {:.1} MB  ckpt {:.1} MB  ({:.0}% reduction)",
+            peak_plain as f64 / 1e6,
+            peak_ckpt as f64 / 1e6,
+            100.0 * (1.0 - peak_ckpt as f64 / peak_plain as f64)
+        );
+        assert!(
+            peak_ckpt < peak_plain,
+            "checkpointing must reduce backward peak memory: plain {peak_plain} vs ckpt {peak_ckpt}"
+        );
+    }
 
     #[test]
     fn test_jvp() {
